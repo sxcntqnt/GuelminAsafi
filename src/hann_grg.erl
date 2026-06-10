@@ -109,7 +109,8 @@ enrich(RawResults) ->
     ),
     lists:reverse(Neighbors).
 
-meta_field(undefined, _Key)          -> null;
+meta_field(undefined, _Key) -> null;
+meta_field(Meta, Key)       -> maps:get(Key, Meta, null).
+
 meta_field(undefined, _Key, Default) -> Default;
-meta_field(Meta, Key)                -> maps:get(Key, Meta, null).
 meta_field(Meta, Key, Default)       -> maps:get(Key, Meta, Default).

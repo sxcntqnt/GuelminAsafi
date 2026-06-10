@@ -1,0 +1,15 @@
+{application, himap_hann, [
+    {description,  "HiMap HANN — HNSW Vector Search for Spatiotemporal Transit Routing"},
+    {vsn,          "0.1.0"},
+    {registered,   [hann_ets, hann_scylla, hann_hnsw, hann_grg]},
+    {mod,          {himap_hann_app, []}},
+    {applications, [kernel, stdlib, inets, crypto, cowboy, marina]},
+    {env, [
+        {port,         8080},
+        {hnsw_dim,     128},
+        {hnsw_m,       16},
+        {hnsw_ef,      64},
+        {hnsw_dist_fn, cosine}
+    ]},
+    {licenses, ["Apache-2.0"]}
+]}.
