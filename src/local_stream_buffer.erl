@@ -1,52 +1,49 @@
-%% local_stream_buffer.erl
-%%
-%% Dual-stream spectral synchronizer with sliding memory windows.
-%%
-%% Three internal stores:
-%%
-%%   tab_hypntyz  : ordered_set {timestamp_us, ref} → HypntyzFrame
-%%   tab_shek3m   : ordered_set {timestamp_us, ref} → Shek3mFrame
-%%   tab_out      : ordered_set {timestamp_us, ref} → JointSpectralEvent
-%%
-%% Region embedding is NOT a sliding buffer.
-%% It is slow state held in the gen_server record, updated explicitly.
-%% It acts as a cohesion bias on alignment confidence — never FFT'd.
-%%
-%% HypntyzFrame:
-%%   #{ event_id        => binary(),
-%%      phenomenon_time => integer(),     %% unix microseconds
-%%      speed_fft       => [float()],     %% FFT bins
-%%      accel_spectrum  => [float()],
-%%      motion_harmonics => [float()],
-%%      metadata        => map() }
-%%
-%% Shek3mFrame:
-%%   #{ event_id         => binary(),
-%%      phenomenon_time  => integer(),
-%%      corridor_fft     => [float()],
-%%      h3_adjacency_fft => [float()],
-%%      route_coherence  => float(),
-%%      metadata         => map() }
-%%
-%% RegionEmbedding:
-%%   #{ urban_rural_vector  => [float()],
-%%      density_embedding   => [float()],
-%%      infrastructure_bias => float(),
-%%      updated_at          => integer() }
-%%
-%% JointSpectralEvent:
-%%   #{ event_id             => binary(),
-%%      phenomenon_time      => integer(),
-%%      temporal_fft         => HypntyzFrame,
-%%      geometric_fft        => Shek3mFrame,
-%%      region_embedding     => RegionEmbedding,
-%%      alignment_confidence => float() }      %% 0.0–1.0
-
+%%%-------------------------------------------------------------------
+%%% @doc LocalStreamBuffer — dual-stream spectral synchroniser
+%%%
+%%% ── Storage layout ────────────────────────────────────────────────
+%%%
+%%%   tab_hypntyz_time   ordered_set  {TS, Seq} → HypntyzFrame
+%%%   tab_shek3m_time    ordered_set  {TS, Seq} → Shek3mFrame
+%%%   tab_hypntyz_event  set          EventID   → {TS, Seq}
+%%%   tab_shek3m_event   set          EventID   → {TS, Seq}
+%%%   tab_out            ordered_set  {TS, Seq} → JointSpectralEvent
+%%%
+%%%   Region embedding is gen_server record state (slow, no sliding).
+%%%
+%%% ── Alignment complexity ─────────────────────────────────────────
+%%%
+%%%   Exact path  (event_id match)  O(1)   — event index hash lookup
+%%%   Fuzzy path  (no id match)     O(k)   — k = frames in ±delta_time
+%%%   Window seek                   O(log n) — ets:next sentinel trick
+%%%
+%%% ── Key design ────────────────────────────────────────────────────
+%%%
+%%%   Keys are {Timestamp_us, Seq} where
+%%%     Seq = erlang:unique_integer([monotonic])
+%%%
+%%%   Benefits over {Timestamp, make_ref()}:
+%%%     • fully ordered (no atom/ref term-order surprises)
+%%%     • no heavyweight reference objects
+%%%     • allows O(log n) lower-bound seek via sentinel tuple
+%%%
+%%% ── Sentinel seek ─────────────────────────────────────────────────
+%%%
+%%%   To find the first key with TS >= Lo in an ordered_set:
+%%%
+%%%     ets:next(Tab, {Lo - 1, []})
+%%%
+%%%   Works because [] (list) > integer in Erlang term order,
+%%%   so {Lo-1, []} is strictly greater than any {Lo-1, integer}
+%%%   key, making it a valid predecessor sentinel.
+%%%   ets:next/2 on ordered_set accepts non-existent keys.
+%%%-------------------------------------------------------------------
 -module(local_stream_buffer).
 -behaviour(gen_server).
 
 -export([
     start_link/1,
+    start_link/2,
     ingest_hypntyz/2,
     ingest_shek3m/2,
     update_region/2,
@@ -55,20 +52,16 @@
     stop/1
 ]).
 
--export([
-    init/1,
-    handle_call/3,
-    handle_cast/2,
-    handle_info/2,
-    terminate/2
-]).
+-export([init/1, handle_call/3, handle_cast/2,
+         handle_info/2, terminate/2]).
 
-%%=============================================================================
+%%====================================================================
 %% Types
-%%=============================================================================
+%%====================================================================
 
 -type timestamp_us() :: integer().
--type ets_key()      :: {timestamp_us(), reference()}.
+-type seq()          :: integer().           %% erlang:unique_integer([monotonic])
+-type ets_key()      :: {timestamp_us(), seq()}.
 
 -type hypntyz_frame() :: #{
     event_id         := binary(),
@@ -100,7 +93,7 @@
     phenomenon_time      := timestamp_us(),
     temporal_fft         := hypntyz_frame(),
     geometric_fft        := shek3m_frame(),
-    region_embedding     := region_embedding(),
+    region_embedding     := region_embedding() | undefined,
     alignment_confidence := float()
 }.
 
@@ -108,47 +101,44 @@
 -type commit_fun() :: fun((ets_key(), term()) -> ok).
 
 -type opts() :: #{
-    %% Maximum time difference (us) between Hypntyz and Shek3m frames to be
-    %% alignment candidates. Default: 500_000 (500ms)
-    delta_time              => timestamp_us(),
-
-    %% Minimum alignment_confidence to emit a JointSpectralEvent. Default: 0.5
-    confidence_threshold    => float(),
-
-    %% Maximum number of frames to retain per window. Default: 500
-    window_size             => pos_integer(),
-
-    %% Called for every emitted JointSpectralEvent (e.g., forward to GuelminAsafi)
-    emit_fun                => emit_fun() | undefined,
-
-    %% Called when a frame is stripped from a window (at-least-once commit hook)
-    commit_fun              => commit_fun() | undefined,
-
-    %% Buffer JointSpectralEvents internally for fetch_results/1. Default: true
-    buffer_results          => boolean(),
-
-    verbose                 => boolean()
+    delta_time           => timestamp_us(),
+    confidence_threshold => float(),
+    window_size          => pos_integer(),
+    emit_fun             => emit_fun() | undefined,
+    commit_fun           => commit_fun() | undefined,
+    buffer_results       => boolean(),
+    verbose              => boolean()
 }.
 
+-export_type([
+    hypntyz_frame/0, shek3m_frame/0,
+    region_embedding/0, joint_spectral_event/0,
+    opts/0
+]).
+
 -record(state, {
-    tab_hypntyz          :: ets:tid(),
-    tab_shek3m           :: ets:tid(),
+    %% Time-series indexes (ordered_set, {TS,Seq} → Frame)
+    tab_hypntyz_time     :: ets:tid(),
+    tab_shek3m_time      :: ets:tid(),
+
+    %% Event-id indexes (set, EventID → {TS,Seq} of latest frame)
+    tab_hypntyz_event    :: ets:tid(),
+    tab_shek3m_event     :: ets:tid(),
+
+    %% Output buffer
     tab_out              :: ets:tid(),
 
     %% Region embedding: slow state, not a sliding buffer
     region_embedding     :: region_embedding() | undefined,
 
-    %% Tuning
     delta_time           :: timestamp_us(),
     confidence_threshold :: float(),
     window_size          :: pos_integer(),
 
-    %% Callbacks
     emit_fun             :: emit_fun() | undefined,
     commit_fun           :: commit_fun() | undefined,
     buffer_results       :: boolean(),
 
-    %% Counters
     count_hypntyz        :: non_neg_integer(),
     count_shek3m         :: non_neg_integer(),
     count_emitted        :: non_neg_integer(),
@@ -156,107 +146,113 @@
     verbose              :: boolean()
 }).
 
-%%=============================================================================
+%%====================================================================
 %% Public API
-%%=============================================================================
+%%====================================================================
 
 -spec start_link(opts()) -> {ok, pid()} | {error, term()}.
 start_link(Opts) ->
     gen_server:start_link(?MODULE, Opts, []).
 
-%% Ingest a frame from the Hypntyz temporal FFT broadcast stream
--spec ingest_hypntyz(pid(), hypntyz_frame()) -> ok.
-ingest_hypntyz(Pid, Frame) ->
-    gen_server:cast(Pid, {ingest, hypntyz, Frame}).
+%% Named variant for supervised use (e.g. start_link(hann_lsb, Opts))
+-spec start_link(atom(), opts()) -> {ok, pid()} | {error, term()}.
+start_link(Name, Opts) ->
+    gen_server:start_link({local, Name}, ?MODULE, Opts, []).
 
-%% Ingest a frame from the Shek3m geometric FFT broadcast stream
--spec ingest_shek3m(pid(), shek3m_frame()) -> ok.
-ingest_shek3m(Pid, Frame) ->
-    gen_server:cast(Pid, {ingest, shek3m, Frame}).
+-spec ingest_hypntyz(pid() | atom(), hypntyz_frame()) -> ok.
+ingest_hypntyz(Srv, Frame) ->
+    gen_server:cast(Srv, {ingest, hypntyz, Frame}).
 
-%% Update the region embedding (slow state — not per-event)
--spec update_region(pid(), region_embedding()) -> ok.
-update_region(Pid, RegionEmbedding) ->
-    gen_server:cast(Pid, {update_region, RegionEmbedding}).
+-spec ingest_shek3m(pid() | atom(), shek3m_frame()) -> ok.
+ingest_shek3m(Srv, Frame) ->
+    gen_server:cast(Srv, {ingest, shek3m, Frame}).
 
-%% Fetch and drain the output buffer
--spec fetch_results(pid()) -> [joint_spectral_event()].
-fetch_results(Pid) ->
-    gen_server:call(Pid, fetch_results).
+-spec update_region(pid() | atom(), region_embedding()) -> ok.
+update_region(Srv, RE) ->
+    gen_server:cast(Srv, {update_region, RE}).
 
--spec counters(pid()) -> map().
-counters(Pid) ->
-    gen_server:call(Pid, counters).
+-spec fetch_results(pid() | atom()) -> [joint_spectral_event()].
+fetch_results(Srv) ->
+    gen_server:call(Srv, fetch_results).
 
--spec stop(pid()) -> ok.
-stop(Pid) ->
-    gen_server:stop(Pid).
+-spec counters(pid() | atom()) -> map().
+counters(Srv) ->
+    gen_server:call(Srv, counters).
 
-%%=============================================================================
+-spec stop(pid() | atom()) -> ok.
+stop(Srv) ->
+    gen_server:stop(Srv).
+
+%%====================================================================
 %% gen_server callbacks
-%%=============================================================================
+%%====================================================================
 
 init(Opts) ->
-    TabH = ets:new(lsb_hypntyz, [ordered_set, private]),
-    TabS = ets:new(lsb_shek3m,  [ordered_set, private]),
-    TabO = ets:new(lsb_out,     [ordered_set, private]),
-    State = #state{
-        tab_hypntyz          = TabH,
-        tab_shek3m           = TabS,
+    TabHT = ets:new(lsb_hypntyz_time,  [ordered_set, private]),
+    TabST = ets:new(lsb_shek3m_time,   [ordered_set, private]),
+    TabHE = ets:new(lsb_hypntyz_event, [set, private]),
+    TabSE = ets:new(lsb_shek3m_event,  [set, private]),
+    TabO  = ets:new(lsb_out,           [ordered_set, private]),
+    {ok, #state{
+        tab_hypntyz_time     = TabHT,
+        tab_shek3m_time      = TabST,
+        tab_hypntyz_event    = TabHE,
+        tab_shek3m_event     = TabSE,
         tab_out              = TabO,
         region_embedding     = undefined,
-        delta_time           = maps:get(delta_time, Opts, 500_000),
+        delta_time           = maps:get(delta_time,           Opts, 500_000),
         confidence_threshold = maps:get(confidence_threshold, Opts, 0.5),
-        window_size          = maps:get(window_size, Opts, 500),
-        emit_fun             = maps:get(emit_fun, Opts, undefined),
-        commit_fun           = maps:get(commit_fun, Opts, undefined),
-        buffer_results       = maps:get(buffer_results, Opts, true),
+        window_size          = maps:get(window_size,          Opts, 500),
+        emit_fun             = maps:get(emit_fun,             Opts, undefined),
+        commit_fun           = maps:get(commit_fun,           Opts, undefined),
+        buffer_results       = maps:get(buffer_results,       Opts, true),
         count_hypntyz        = 0,
         count_shek3m         = 0,
         count_emitted        = 0,
-        verbose              = maps:get(verbose, Opts, false)
-    },
-    {ok, State}.
+        verbose              = maps:get(verbose,              Opts, false)
+    }}.
 
 handle_cast({ingest, hypntyz, Frame}, State) ->
     TS  = maps:get(phenomenon_time, Frame),
-    Key = {TS, make_ref()},
-    ets:insert(State#state.tab_hypntyz, {Key, Frame}),
-    log(State, "ingest hypntyz ts=~p", [TS]),
-    State1 = State#state{count_hypntyz = State#state.count_hypntyz + 1},
-    %% Attempt alignment: newest Hypntyz frame seeks Shek3m partners
-    State2 = run_alignment(hypntyz, Key, State1),
-    State3 = enforce_window(State#state.tab_hypntyz, State#state.window_size,
-                            hypntyz, State2),
-    {noreply, State3};
+    Key = {TS, erlang:unique_integer([monotonic])},
+    ets:insert(State#state.tab_hypntyz_time, {Key, Frame}),
+    index_event(State#state.tab_hypntyz_event,
+                maps:get(event_id, Frame, undefined), Key),
+    log(State, "ingest hypntyz ts=~w", [TS]),
+    S1 = State#state{count_hypntyz = State#state.count_hypntyz + 1},
+    S2 = run_alignment(hypntyz, Key, Frame, S1),
+    S3 = enforce_window(State#state.tab_hypntyz_time,
+                        State#state.tab_hypntyz_event,
+                        State#state.window_size, hypntyz, S2),
+    {noreply, S3};
 
 handle_cast({ingest, shek3m, Frame}, State) ->
     TS  = maps:get(phenomenon_time, Frame),
-    Key = {TS, make_ref()},
-    ets:insert(State#state.tab_shek3m, {Key, Frame}),
-    log(State, "ingest shek3m ts=~p", [TS]),
-    State1 = State#state{count_shek3m = State#state.count_shek3m + 1},
-    %% Attempt alignment: newest Shek3m frame seeks Hypntyz partners
-    State2 = run_alignment(shek3m, Key, State1),
-    State3 = enforce_window(State#state.tab_shek3m, State#state.window_size,
-                            shek3m, State3),
-    {noreply, State3};
+    Key = {TS, erlang:unique_integer([monotonic])},
+    ets:insert(State#state.tab_shek3m_time, {Key, Frame}),
+    index_event(State#state.tab_shek3m_event,
+                maps:get(event_id, Frame, undefined), Key),
+    log(State, "ingest shek3m ts=~w", [TS]),
+    S1 = State#state{count_shek3m = State#state.count_shek3m + 1},
+    S2 = run_alignment(shek3m, Key, Frame, S1),
+    S3 = enforce_window(State#state.tab_shek3m_time,
+                        State#state.tab_shek3m_event,
+                        State#state.window_size, shek3m, S2),
+    {noreply, S3};
 
-handle_cast({update_region, RegionEmbedding}, State) ->
-    %% Region is slow state — just replace, no FFT, no alignment trigger
-    log(State, "region embedding updated at=~p",
-        [maps:get(updated_at, RegionEmbedding, 0)]),
-    {noreply, State#state{region_embedding = RegionEmbedding}};
+handle_cast({update_region, RE}, State) ->
+    log(State, "region updated at=~w", [maps:get(updated_at, RE, 0)]),
+    {noreply, State#state{region_embedding = RE}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_call(fetch_results, _From, State) ->
     Events = [E || {_K, E} <- ets:tab2list(State#state.tab_out)],
-    %% Sort by phenomenon_time ascending before returning
-    Sorted = lists:sort(fun(A, B) ->
-        maps:get(phenomenon_time, A) =< maps:get(phenomenon_time, B)
-    end, Events),
+    Sorted = lists:sort(
+        fun(A, B) ->
+            maps:get(phenomenon_time, A) =< maps:get(phenomenon_time, B)
+        end, Events),
     ets:delete_all_objects(State#state.tab_out),
     {reply, Sorted, State};
 
@@ -270,119 +266,146 @@ handle_call(counters, _From, State) ->
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown}, State}.
 
-handle_info(_Info, State) ->
-    {noreply, State}.
+handle_info(_Info, State) -> {noreply, State}.
 
 terminate(_Reason, State) ->
-    ets:delete(State#state.tab_hypntyz),
-    ets:delete(State#state.tab_shek3m),
+    ets:delete(State#state.tab_hypntyz_time),
+    ets:delete(State#state.tab_shek3m_time),
+    ets:delete(State#state.tab_hypntyz_event),
+    ets:delete(State#state.tab_shek3m_event),
     ets:delete(State#state.tab_out),
     ok.
 
-%%=============================================================================
+%%====================================================================
 %% Alignment Engine
-%%=============================================================================
+%%====================================================================
 %%
-%% When a new frame arrives on either stream, the alignment engine searches
-%% the OTHER stream's sliding window for candidates within delta_time.
+%% Two-phase strategy:
 %%
-%% For each candidate pair (HypntyzFrame, Shek3mFrame):
-%%   1. Check event_id match (strong signal — same originating event)
-%%   2. Compute temporal proximity score
-%%   3. Apply region embedding as cohesion bias
-%%   4. Compute alignment_confidence
-%%   5. If confidence >= threshold → emit JointSpectralEvent
+%%  EXACT  O(1) — event index lookup.
+%%         Same event_id in both streams → align immediately.
+%%         Accounts for 0.50 weight in confidence.
 %%
-%% This replaces the generic JR1/JR2/JS2 join cases with semantically
-%% meaningful alignment logic.
+%%  FUZZY  O(k) — temporal range scan, k = frames in ±delta_time.
+%%         Only applied to frames whose event_id ≠ pivot event_id
+%%         (exact-matched frames are excluded to prevent double-emit).
+%%
+%%  Early-exit — if the newest frame in the exterior window predates
+%%  (pivot_ts - delta_time), skip the fuzzy path entirely.
 
--spec run_alignment(hypntyz | shek3m, ets_key(), #state{}) -> #state{}.
-run_alignment(PivotalStream, NewKey, State) ->
-    {PivotalTab, ExteriorTab} = case PivotalStream of
-        hypntyz -> {State#state.tab_hypntyz, State#state.tab_shek3m};
-        shek3m  -> {State#state.tab_shek3m,  State#state.tab_hypntyz}
+-spec run_alignment(hypntyz | shek3m, ets_key(), map(), #state{}) -> #state{}.
+run_alignment(Stream, Key, Frame, State) ->
+    EID = maps:get(event_id, Frame, undefined),
+    {ExtTimeTab, ExtEventTab} = exterior_tabs(Stream, State),
+    NewTS = maps:get(phenomenon_time, Frame),
+
+    %% ── Phase 1: exact event-id lookup ──────────────────────────────
+    {State1, ExactKey} = case exact_match(EID, ExtEventTab, ExtTimeTab) of
+        {found, CandKey, CandFrame} ->
+            St = align_and_emit(Stream, Frame, CandFrame, Key, CandKey, State),
+            {St, CandKey};
+        not_found ->
+            {State, undefined}
     end,
-    case ets:lookup(PivotalTab, NewKey) of
-        [] -> State;
-        [{NewKey, NewFrame}] ->
-            NewTS = maps:get(phenomenon_time, NewFrame),
-            %% Find all exterior frames within delta_time of NewTS
-            Candidates = find_candidates(ExteriorTab, NewTS, State#state.delta_time),
-            %% For each candidate, compute alignment and maybe emit
+
+    %% ── Phase 2: fuzzy temporal scan (early-exit check first) ───────
+    case needs_fuzzy_scan(ExtTimeTab, NewTS, State#state.delta_time) of
+        false ->
+            State1;
+        true ->
+            Candidates = find_candidates(ExtTimeTab, NewTS, State#state.delta_time),
+            %% Exclude: the frame from exact path + any frame with same event_id
+            Filtered = [P || {CK, CF} = P <- Candidates,
+                             CK =/= ExactKey,
+                             maps:get(event_id, CF, undefined) =/= EID],
             lists:foldl(
-                fun({CandKey, CandFrame}, St) ->
-                    align_and_emit(PivotalStream, NewFrame, CandFrame,
-                                   NewKey, CandKey, St)
+                fun({CK, CF}, St) ->
+                    align_and_emit(Stream, Frame, CF, Key, CK, St)
                 end,
-                State,
-                Candidates
+                State1,
+                Filtered
             )
     end.
 
-%% Find all frames in Tab with |ts - pivot_ts| <= delta_time
+%% O(1) event-id lookup into exterior stream's event index
+exact_match(undefined, _EventTab, _TimeTab) ->
+    not_found;
+exact_match(EID, EventTab, TimeTab) ->
+    case ets:lookup(EventTab, EID) of
+        [{EID, CandKey}] ->
+            case ets:lookup(TimeTab, CandKey) of
+                [{CandKey, CandFrame}] -> {found, CandKey, CandFrame};
+                []                     -> not_found
+            end;
+        [] ->
+            not_found
+    end.
+
+%% Early-exit: if the newest exterior frame is older than
+%% (pivot_ts - delta_time), no temporal candidates exist.
+needs_fuzzy_scan(Tab, PivotTS, DeltaTime) ->
+    case ets:last(Tab) of
+        '$end_of_table' -> false;
+        {LastTS, _}     -> LastTS >= (PivotTS - DeltaTime)
+    end.
+
+%%====================================================================
+%% Temporal range scan  O(log n + k)
+%%====================================================================
+
+%% Find all frames in Tab with |ts - PivotTS| <= DeltaTime.
+%% Seek is O(log n) via the sentinel; iteration is O(k).
 -spec find_candidates(ets:tid(), timestamp_us(), timestamp_us()) ->
     [{ets_key(), map()}].
 find_candidates(Tab, PivotTS, DeltaTime) ->
     Lo = PivotTS - DeltaTime,
     Hi = PivotTS + DeltaTime,
-    %% Walk from first key >= Lo
-    StartKey = first_at_or_after(Tab, Lo),
+    %% Sentinel: {Lo-1, []} > any {Lo-1, integer} because list > integer
+    %% in Erlang term order.  ets:next on ordered_set accepts any term.
+    StartKey = ets:next(Tab, {Lo - 1, []}),
     collect_range(Tab, StartKey, Hi, []).
 
 collect_range(_Tab, '$end_of_table', _Hi, Acc) ->
     lists:reverse(Acc);
-collect_range(Tab, Key, Hi, Acc) ->
-    {TS, _} = Key,
-    case TS > Hi of
-        true  -> lists:reverse(Acc);
-        false ->
-            [{Key, Frame}] = ets:lookup(Tab, Key),
-            collect_range(Tab, ets:next(Tab, Key), Hi, [{Key, Frame} | Acc])
-    end.
+collect_range(Tab, {TS, _} = Key, Hi, Acc) when TS =< Hi ->
+    [{Key, Frame}] = ets:lookup(Tab, Key),
+    collect_range(Tab, ets:next(Tab, Key), Hi, [{Key, Frame} | Acc]);
+collect_range(_Tab, _Key, _Hi, Acc) ->
+    lists:reverse(Acc).
 
-%%=============================================================================
-%% Alignment confidence computation
-%%=============================================================================
+%%====================================================================
+%% Confidence computation
+%%====================================================================
 %%
-%% confidence = weighted combination of:
-%%   - event_id_match    : 1.0 if same event_id, else 0.0   weight: 0.50
-%%   - temporal_proximity: 1 - (|dt| / delta_time)           weight: 0.30
-%%   - region_bias       : infrastructure_bias from region   weight: 0.20
+%%  confidence = 0.50 * event_id_score
+%%             + 0.30 * temporal_proximity_score
+%%             + 0.20 * region_cohesion_bias
 %%
-%% Region embedding acts as a cohesion field:
-%%   high infrastructure_bias → lower confidence threshold needed
-%%   (dense urban areas have higher signal correlation between FFT streams)
+%%  event_id_score    : 1.0 if same id, else 0.0
+%%  temporal_proximity: 1 - |dt| / delta_time
+%%  region_bias       : infrastructure_bias from region embedding
+%%                      (0.5 if no region state loaded)
 
 -spec align_and_emit(
-    hypntyz | shek3m,
-    hypntyz_frame() | shek3m_frame(),
-    shek3m_frame()  | hypntyz_frame(),
-    ets_key(), ets_key(),
-    #state{}
-) -> #state{}.
-align_and_emit(PivotalStream, PivotalFrame, ExteriorFrame,
-               _PivotalKey, _ExteriorKey, State) ->
-    {HFrame, SFrame} = case PivotalStream of
-        hypntyz -> {PivotalFrame, ExteriorFrame};
-        shek3m  -> {ExteriorFrame, PivotalFrame}
+    hypntyz | shek3m, map(), map(),
+    ets_key(), ets_key(), #state{}) -> #state{}.
+align_and_emit(Stream, PivotFrame, ExteriorFrame,
+               _PK, _EK, State) ->
+    {HFrame, SFrame} = case Stream of
+        hypntyz -> {PivotFrame,   ExteriorFrame};
+        shek3m  -> {ExteriorFrame, PivotFrame}
     end,
-
     Confidence = compute_confidence(HFrame, SFrame, State),
-
-    log(State, "alignment confidence=~.3f threshold=~.3f",
+    log(State, "align conf=~.3f threshold=~.3f",
         [Confidence, State#state.confidence_threshold]),
-
     case Confidence >= State#state.confidence_threshold of
-        false ->
-            State;
-        true ->
-            %% Build the JointSpectralEvent
-            PhenomenonTime = (maps:get(phenomenon_time, HFrame) +
-                              maps:get(phenomenon_time, SFrame)) div 2,
-            EventId = resolve_event_id(HFrame, SFrame),
+        false -> State;
+        true  ->
+            PT = (maps:get(phenomenon_time, HFrame) +
+                  maps:get(phenomenon_time, SFrame)) div 2,
             Event = #{
-                event_id             => EventId,
-                phenomenon_time      => PhenomenonTime,
+                event_id             => resolve_event_id(HFrame, SFrame),
+                phenomenon_time      => PT,
                 temporal_fft         => HFrame,
                 geometric_fft        => SFrame,
                 region_embedding     => State#state.region_embedding,
@@ -391,17 +414,15 @@ align_and_emit(PivotalStream, PivotalFrame, ExteriorFrame,
             emit_event(Event, State)
     end.
 
--spec compute_confidence(hypntyz_frame(), shek3m_frame(), #state{}) -> float().
+-spec compute_confidence(map(), map(), #state{}) -> float().
 compute_confidence(HFrame, SFrame, State) ->
-    %% Component 1: event_id match (weight 0.50)
     H_EID = maps:get(event_id, HFrame, undefined),
     S_EID = maps:get(event_id, SFrame, undefined),
-    EventIdScore = case H_EID =:= S_EID andalso H_EID =/= undefined of
+    EventScore = case H_EID =:= S_EID andalso H_EID =/= undefined of
         true  -> 1.0;
         false -> 0.0
     end,
 
-    %% Component 2: temporal proximity (weight 0.30)
     H_TS = maps:get(phenomenon_time, HFrame),
     S_TS = maps:get(phenomenon_time, SFrame),
     Dt   = abs(H_TS - S_TS),
@@ -410,20 +431,15 @@ compute_confidence(HFrame, SFrame, State) ->
         DT -> max(0.0, 1.0 - (Dt / DT))
     end,
 
-    %% Component 3: region cohesion bias (weight 0.20)
-    %% infrastructure_bias is 0.0–1.0; dense urban = closer to 1.0
     RegionBias = case State#state.region_embedding of
-        undefined -> 0.5;   %% neutral when no region state loaded
+        undefined -> 0.5;
         R         -> maps:get(infrastructure_bias, R, 0.5)
     end,
 
-    Confidence = (0.50 * EventIdScore) +
-                 (0.30 * TemporalScore) +
-                 (0.20 * RegionBias),
-    min(1.0, max(0.0, Confidence)).
+    min(1.0, max(0.0,
+        (0.50 * EventScore) + (0.30 * TemporalScore) + (0.20 * RegionBias)
+    )).
 
-%% Prefer matching event_id; fall back to Hypntyz event_id
--spec resolve_event_id(hypntyz_frame(), shek3m_frame()) -> binary().
 resolve_event_id(HFrame, SFrame) ->
     H_EID = maps:get(event_id, HFrame, undefined),
     S_EID = maps:get(event_id, SFrame, undefined),
@@ -432,77 +448,78 @@ resolve_event_id(HFrame, SFrame) ->
         false -> H_EID   %% Hypntyz is the temporal authority
     end.
 
-%%=============================================================================
+%%====================================================================
 %% Emit
-%%=============================================================================
+%%====================================================================
 
 -spec emit_event(joint_spectral_event(), #state{}) -> #state{}.
 emit_event(Event, State) ->
     TS  = maps:get(phenomenon_time, Event),
-    Key = {TS, make_ref()},
-    %% Buffer internally if configured
+    Key = {TS, erlang:unique_integer([monotonic])},
     case State#state.buffer_results of
         true  -> ets:insert(State#state.tab_out, {Key, Event});
         false -> ok
     end,
-    %% Forward to GuelminAsafi via emit_fun callback
     case State#state.emit_fun of
         undefined -> ok;
-        Fun       -> Fun(Event)
+        Fun       -> spawn(fun() -> Fun(Event) end)
     end,
-    log(State, "emit JointSpectralEvent event_id=~s confidence=~.3f",
-        [maps:get(event_id, Event), maps:get(alignment_confidence, Event)]),
+    log(State, "emit event_id=~s conf=~.3f",
+        [maps:get(event_id, Event, <<"?">>),
+         maps:get(alignment_confidence, Event, 0.0)]),
     State#state{count_emitted = State#state.count_emitted + 1}.
 
-%%=============================================================================
+%%====================================================================
 %% Window enforcement
-%%=============================================================================
-%%
-%% Each sliding window is bounded by window_size.
-%% When the window exceeds the limit, oldest frames are stripped from the head.
-%% The commit_fun is called for each stripped frame (at-least-once hook).
+%%====================================================================
 
--spec enforce_window(ets:tid(), pos_integer(), hypntyz | shek3m, #state{}) -> #state{}.
-enforce_window(Tab, MaxSize, Side, State) ->
-    Over = ets:info(Tab, size) - MaxSize,
-    case Over > 0 of
+-spec enforce_window(ets:tid(), ets:tid(), pos_integer(),
+                     hypntyz | shek3m, #state{}) -> #state{}.
+enforce_window(TimeTab, EventTab, MaxSize, Side, State) ->
+    Excess = ets:info(TimeTab, size) - MaxSize,
+    case Excess > 0 of
         false -> State;
-        true  -> drop_oldest(Tab, Over, Side, State)
+        true  -> drop_oldest(TimeTab, EventTab, Excess, Side, State)
     end.
 
-drop_oldest(_Tab, 0, _Side, State) -> State;
-drop_oldest(Tab, N, Side, State) ->
-    case ets:first(Tab) of
+drop_oldest(_TT, _ET, 0, _Side, State) -> State;
+drop_oldest(TimeTab, EventTab, N, Side, State) ->
+    case ets:first(TimeTab) of
         '$end_of_table' ->
             State;
         Key ->
-            [{Key, Frame}] = ets:lookup(Tab, Key),
-            ets:delete(Tab, Key),
+            [{Key, Frame}] = ets:lookup(TimeTab, Key),
+            ets:delete(TimeTab, Key),
+            remove_event_index(EventTab,
+                               maps:get(event_id, Frame, undefined),
+                               Key),
             maybe_commit(State#state.commit_fun, Key, Frame),
-            log(State, "window strip ~p key=~p", [Side, Key]),
-            drop_oldest(Tab, N - 1, Side, State)
+            log(State, "strip ~w key=~w", [Side, Key]),
+            drop_oldest(TimeTab, EventTab, N - 1, Side, State)
     end.
 
-%%=============================================================================
-%% ETS traversal helpers
-%%=============================================================================
-
--spec first_at_or_after(ets:tid(), timestamp_us()) -> ets_key() | '$end_of_table'.
-first_at_or_after(Tab, TS) ->
-    walk_forward(Tab, ets:first(Tab), TS).
-
-walk_forward(_Tab, '$end_of_table', _TS) ->
-    '$end_of_table';
-walk_forward(Tab, Key, TS) ->
-    {KTS, _} = Key,
-    case KTS >= TS of
-        true  -> Key;
-        false -> walk_forward(Tab, ets:next(Tab, Key), TS)
-    end.
-
-%%=============================================================================
+%%====================================================================
 %% Internal helpers
-%%=============================================================================
+%%====================================================================
+
+%% Insert into event index only when event_id is defined.
+%% Latest frame always overwrites (last-write-wins per event_id).
+index_event(_Tab, undefined, _Key) -> ok;
+index_event(Tab, EID, Key)         -> ets:insert(Tab, {EID, Key}).
+
+%% Remove event index entry only if it still points to the key being dropped.
+remove_event_index(_Tab, undefined, _Key) -> ok;
+remove_event_index(Tab, EID, Key) ->
+    case ets:lookup(Tab, EID) of
+        [{EID, Key}] -> ets:delete(Tab, EID);
+        _            -> ok   %% newer frame has already updated the index
+    end.
+
+%% Return the exterior stream's {time_tab, event_tab}
+exterior_tabs(hypntyz, State) ->
+    {State#state.tab_shek3m_time, State#state.tab_shek3m_event};
+exterior_tabs(shek3m, State) ->
+    {State#state.tab_hypntyz_time, State#state.tab_hypntyz_event}.
 
 maybe_commit(undefined, _Key, _Frame) -> ok;
 maybe_commit(Fun, Key, Frame)         -> Fun(Key, Frame).

@@ -1,5 +1,5 @@
 ELVIS=./bin/elvis
-REBAR=./bin/rebar3
+REBAR=rebar3
 
 all: compile
 
