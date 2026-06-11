@@ -3,9 +3,9 @@
     {vsn,          "0.1.0"},
     {registered,   [hann_ets, hann_scylla, hann_hnsw, hann_grg, hann_lsb]},
     {mod,          {himap_hann_app, []}},
-    {applications, [kernel, stdlib, inets, crypto, cowboy, marina]},
+    {applications, [kernel, stdlib, inets, crypto, cowboy, jiffy, marina]},
     {env, [
-        {port,         8080},
+        {port,         9180},
         {hnsw_dim,     128},
         {hnsw_m,       16},
         {hnsw_ef,      64},

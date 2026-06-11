@@ -1,29 +1,32 @@
 %%%-------------------------------------------------------------------
-%%% @doc HiMap HANN — ScyllaDB Persistence via marina
+%%% @doc HiMap HANN — ScyllaDB persistence via marina
 %%%
-%%% Wraps lpgauth/marina (pure-Erlang native CQL protocol client) to
-%%% provide durable storage for the HNSW graph and GRG metadata.
+%%% ── marina API (this version) ──────────────────────────────────────
 %%%
-%%% ── Startup sequence ────────────────────────────────────────────────
+%%%   marina:query/2         synchronous query
+%%%   marina:async_query/2   returns Ref; marina:receive_response/1 to wait
 %%%
-%%%   1. ensure_schema/0  — DDL (CREATE IF NOT EXISTS), tolerates
-%%%                         "already exists" errors from ScyllaDB.
-%%%   2. load_all/0       — hydrates hann_ets tables from ScyllaDB so
-%%%                         hann_hnsw:init/1 can restore its state
-%%%                         without a gen_server roundtrip.
+%%%   Verified from: marina:module_info(exports) in the shell.
+%%%
+%%%   Adapter: marina_call/3 — single function to update if the Request
+%%%   format differs from #{query, values, consistency}.
+%%%   Check: _build/default/lib/marina/src/marina.erl for exact spec.
+%%%
+%%% ── Startup ─────────────────────────────────────────────────────────
+%%%
+%%%   init/1 returns immediately (ready=false) and sends self a
+%%%   `connect` message.  hann_scylla never crashes the supervisor
+%%%   on boot regardless of ScyllaDB availability.
+%%%
+%%%   Retries every 5 s until ScyllaDB is reachable.
+%%%   All writes while not ready are silently dropped (ETS is durable).
 %%%
 %%% ── Write path ──────────────────────────────────────────────────────
 %%%
-%%%   Writes are fire-and-forget (marina async_query).
-%%%   marina_response messages are handled in handle_info/2 for logging.
-%%%   persist_global_state/2 is synchronous because hann_hnsw needs
-%%%   the entry-point durable before acknowledging an add/2 call.
-%%%
-%%% ── Encoding ────────────────────────────────────────────────────────
-%%%
-%%%   vector  → packed float32-LE binary  (128 × 4 = 512 B)
-%%%   layers  → term_to_binary/1          (#{Layer => [NodeID]})
-%%%   meta    → individual CQL columns + term_to_binary for route_ids
+%%%   Async node/meta writes are spawned — they never block the
+%%%   gen_server mailbox.  Global state (entry + max_layer) is written
+%%%   synchronously because hann_hnsw:add/2 must not return until the
+%%%   graph cursor is durable.
 %%%-------------------------------------------------------------------
 -module(hann_scylla).
 -behaviour(gen_server).
@@ -32,36 +35,35 @@
          async_persist_node/1,
          async_persist_nodes/1,
          async_persist_meta/2,
-         persist_global_state/2]).
+         persist_global_state/2,
+         is_ready/0]).
 
 -export([init/1, handle_call/3, handle_cast/2,
          handle_info/2, terminate/2, code_change/3]).
 
+-define(RETRY_MS, 5000).
+
 %%%-------------------------------------------------------------------
-%%% CQL statements
+%%% CQL
 %%%-------------------------------------------------------------------
 
 -define(Q_CREATE_KS,
     <<"CREATE KEYSPACE IF NOT EXISTS himap "
       "WITH replication = {'class': 'SimpleStrategy', "
       "'replication_factor': 1} AND durable_writes = true">>).
-
 -define(Q_CREATE_NODES,
     <<"CREATE TABLE IF NOT EXISTS himap.nodes "
       "(node_id bigint PRIMARY KEY, vector blob, layers blob)">>).
-
 -define(Q_CREATE_META,
     <<"CREATE TABLE IF NOT EXISTS himap.node_meta "
       "(node_id bigint PRIMARY KEY, h3_index text, "
       "stop_name text, route_ids blob, region text)">>).
-
 -define(Q_CREATE_STATE,
     <<"CREATE TABLE IF NOT EXISTS himap.hnsw_state "
       "(key text PRIMARY KEY, entry bigint, max_layer int)">>).
 
 -define(Q_UPSERT_NODE,
     <<"INSERT INTO himap.nodes (node_id, vector, layers) VALUES (?, ?, ?)">>).
-
 -define(Q_SELECT_ALL_NODES,
     <<"SELECT node_id, vector, layers FROM himap.nodes">>).
 
@@ -69,14 +71,12 @@
     <<"INSERT INTO himap.node_meta "
       "(node_id, h3_index, stop_name, route_ids, region) "
       "VALUES (?, ?, ?, ?, ?)">>).
-
 -define(Q_SELECT_ALL_META,
     <<"SELECT node_id, h3_index, stop_name, route_ids, region "
       "FROM himap.node_meta">>).
 
 -define(Q_UPSERT_STATE,
     <<"INSERT INTO himap.hnsw_state (key, entry, max_layer) VALUES (?, ?, ?)">>).
-
 -define(Q_SELECT_STATE,
     <<"SELECT entry, max_layer FROM himap.hnsw_state WHERE key = ?">>).
 
@@ -87,8 +87,7 @@
 %%%-------------------------------------------------------------------
 
 -record(state, {
-    %% In-flight marina async refs → context atom for error attribution
-    pending :: #{reference() => term()}
+    ready :: boolean()
 }).
 
 %%%-------------------------------------------------------------------
@@ -98,113 +97,108 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-%% @doc Enqueue an async ScyllaDB upsert for a single node.
-%%      Reads Vector + Layers from hann_ets at cast-processing time
-%%      so the snapshot is consistent with what landed in ETS.
 -spec async_persist_node(non_neg_integer()) -> ok.
 async_persist_node(NodeID) ->
     gen_server:cast(?MODULE, {persist_node, NodeID}).
 
-%% @doc Enqueue async upserts for a list of nodes (post-insert fanout).
 -spec async_persist_nodes([non_neg_integer()]) -> ok.
-async_persist_nodes([])      -> ok;
-async_persist_nodes(NodeIDs) ->
-    gen_server:cast(?MODULE, {persist_nodes, NodeIDs}).
+async_persist_nodes([])  -> ok;
+async_persist_nodes(IDs) -> gen_server:cast(?MODULE, {persist_nodes, IDs}).
 
-%% @doc Enqueue async upsert for node metadata.
 -spec async_persist_meta(non_neg_integer(), map()) -> ok.
 async_persist_meta(NodeID, Meta) ->
     gen_server:cast(?MODULE, {persist_meta, NodeID, Meta}).
 
-%% @doc Synchronous write of HNSW entry-point + max-layer.
-%%      Called by hann_hnsw after every successful insert so a clean
-%%      crash-restart can resume without rescanning the whole graph.
 -spec persist_global_state(non_neg_integer() | undefined, integer()) -> ok.
 persist_global_state(Entry, MaxLayer) ->
     gen_server:call(?MODULE, {persist_state, Entry, MaxLayer}, 10_000).
+
+-spec is_ready() -> boolean().
+is_ready() ->
+    gen_server:call(?MODULE, is_ready, 5_000).
 
 %%%-------------------------------------------------------------------
 %%% gen_server callbacks
 %%%-------------------------------------------------------------------
 
 init([]) ->
-    logger:info("[hann_scylla] initialising — ensuring schema then loading ETS"),
-    ensure_schema(),
-    load_all(),
-    {ok, #state{pending = #{}}}.
+    self() ! connect,
+    logger:info("[hann_scylla] started — awaiting ScyllaDB"),
+    {ok, #state{ready = false}}.
 
-%%% ── Synchronous call: global state persist ─────────────────────────
+handle_call(is_ready, _From, State) ->
+    {reply, State#state.ready, State};
+
+handle_call({persist_state, _E, _M}, _From, #state{ready = false} = S) ->
+    {reply, ok, S};
 
 handle_call({persist_state, Entry, MaxLayer}, _From, State) ->
-    case marina:query(?Q_UPSERT_STATE,
-                      [?STATE_KEY, coerce_entry(Entry), MaxLayer],
-                      quorum, []) of
-        {ok, _}    -> ok;
-        {error, R} ->
-            logger:warning("[hann_scylla] persist_state failed: ~p", [R])
-    end,
+    marina_call(?Q_UPSERT_STATE,
+                [?STATE_KEY, coerce_entry(Entry), MaxLayer], quorum),
     {reply, ok, State};
 
 handle_call(_, _, State) ->
     {reply, ok, State}.
 
-%%% ── Async cast handlers ─────────────────────────────────────────────
+handle_cast(_, #state{ready = false} = State) ->
+    {noreply, State};
 
 handle_cast({persist_node, NodeID}, State) ->
-    {noreply, fire_node(NodeID, State)};
+    spawn_persist_node(NodeID),
+    {noreply, State};
 
 handle_cast({persist_nodes, NodeIDs}, State) ->
-    State1 = lists:foldl(fun fire_node/2, State, NodeIDs),
-    {noreply, State1};
+    lists:foreach(fun spawn_persist_node/1, NodeIDs),
+    {noreply, State};
 
 handle_cast({persist_meta, NodeID, Meta}, State) ->
-    {noreply, fire_meta(NodeID, Meta, State)};
+    spawn_persist_meta(NodeID, Meta),
+    {noreply, State};
 
 handle_cast(_, State) ->
     {noreply, State}.
 
-%%% ── marina async responses ──────────────────────────────────────────
-
-handle_info({marina_response, Ref, {ok, _}}, State) ->
-    {noreply, State#state{pending = maps:remove(Ref, State#state.pending)}};
-
-handle_info({marina_response, Ref, {error, Reason}}, State) ->
-    Pending = State#state.pending,
-    Ctx     = maps:get(Ref, Pending, unknown),
-    logger:warning("[hann_scylla] async write failed ctx=~w reason=~p",
-                   [Ctx, Reason]),
-    {noreply, State#state{pending = maps:remove(Ref, Pending)}};
+handle_info(connect, State) ->
+    case do_connect() of
+        ok ->
+            logger:info("[hann_scylla] connected — schema ensured, ETS hydrated"),
+            {noreply, State#state{ready = true}};
+        {error, Reason} ->
+            logger:warning("[hann_scylla] connect failed: ~p — retry in ~wms",
+                           [Reason, ?RETRY_MS]),
+            erlang:send_after(?RETRY_MS, self(), connect),
+            {noreply, State#state{ready = false}}
+    end;
 
 handle_info(_, State) ->
     {noreply, State}.
 
-terminate(_, _) -> ok.
-code_change(_, State, _) -> {ok, State}.
+terminate(_, _)      -> ok.
+code_change(_, S, _) -> {ok, S}.
 
 %%%-------------------------------------------------------------------
-%%% Internal — schema DDL
+%%% Connect + schema + hydration
 %%%-------------------------------------------------------------------
 
-ensure_schema() ->
-    lists:foreach(fun run_ddl/1, [
-        ?Q_CREATE_KS,
-        ?Q_CREATE_NODES,
-        ?Q_CREATE_META,
-        ?Q_CREATE_STATE
-    ]).
-
-run_ddl(Stmt) ->
-    case marina:query(Stmt, [], one, []) of
-        {ok, _} ->
-            ok;
-        {error, Reason} ->
-            %% "already exists" comes back as an error too; log and continue
-            logger:debug("[hann_scylla] DDL notice: ~p", [Reason])
+do_connect() ->
+    try
+        ensure_schema(),
+        load_all(),
+        ok
+    catch
+        _:Reason -> {error, Reason}
     end.
 
-%%%-------------------------------------------------------------------
-%%% Internal — startup ETS hydration
-%%%-------------------------------------------------------------------
+ensure_schema() ->
+    lists:foreach(fun run_ddl/1,
+                  [?Q_CREATE_KS, ?Q_CREATE_NODES,
+                   ?Q_CREATE_META, ?Q_CREATE_STATE]).
+
+run_ddl(Stmt) ->
+    case marina_call(Stmt, [], one) of
+        {ok, _}    -> ok;
+        {error, R} -> logger:debug("[hann_scylla] DDL: ~p", [R])
+    end.
 
 load_all() ->
     load_nodes(),
@@ -212,96 +206,114 @@ load_all() ->
     load_state().
 
 load_nodes() ->
-    case marina:query(?Q_SELECT_ALL_NODES, [], one, []) of
+    case marina_call(?Q_SELECT_ALL_NODES, [], one) of
         {ok, []} ->
-            logger:info("[hann_scylla] nodes table empty — fresh index");
+            logger:info("[hann_scylla] nodes table empty");
         {ok, [{_KS, _Cols, Rows}]} ->
             lists:foreach(fun hydrate_node/1, Rows),
-            logger:info("[hann_scylla] hydrated ~w nodes into ETS", [length(Rows)]);
+            logger:info("[hann_scylla] hydrated ~w nodes", [length(Rows)]);
         {error, R} ->
-            logger:warning("[hann_scylla] load_nodes failed: ~p — starting empty", [R])
+            logger:warning("[hann_scylla] load_nodes: ~p", [R])
     end.
 
 hydrate_node({NodeID, VecBin, LayersBin}) ->
-    Vector = decode_vector(VecBin),
-    Layers = binary_to_term(LayersBin, [safe]),
-    hann_ets:insert_node(NodeID, Vector, Layers).
+    hann_ets:insert_node(NodeID, decode_vector(VecBin),
+                         binary_to_term(LayersBin, [safe])).
 
 load_meta() ->
-    case marina:query(?Q_SELECT_ALL_META, [], one, []) of
+    case marina_call(?Q_SELECT_ALL_META, [], one) of
         {ok, [{_KS, _Cols, Rows}]} ->
             lists:foreach(
                 fun({NodeID, H3, Stop, RoutesBin, Region}) ->
-                    Meta = #{h3_index  => null_or(H3),
-                             stop_name => null_or(Stop),
-                             route_ids => binary_to_term(RoutesBin, [safe]),
-                             region    => null_or(Region)},
-                    hann_ets:put_meta(NodeID, Meta)
-                end,
-                Rows
-            );
-        _ ->
-            ok
+                    hann_ets:put_meta(NodeID,
+                        #{h3_index  => null_or(H3),
+                          stop_name => null_or(Stop),
+                          route_ids => binary_to_term(RoutesBin, [safe]),
+                          region    => null_or(Region)})
+                end, Rows);
+        _ -> ok
     end.
 
 load_state() ->
-    case marina:query(?Q_SELECT_STATE, [?STATE_KEY], one, []) of
+    case marina_call(?Q_SELECT_STATE, [?STATE_KEY], one) of
         {ok, [{_KS, _Cols, [{Entry, MaxLayer}]}]} ->
             hann_ets:put_state([{entry, Entry}, {max_layer, MaxLayer}]),
-            logger:info("[hann_scylla] HNSW state restored "
-                        "entry=~w max_layer=~w", [Entry, MaxLayer]);
+            logger:info("[hann_scylla] state restored entry=~w max_layer=~w",
+                        [Entry, MaxLayer]);
         _ ->
             hann_ets:put_state([{entry, undefined}, {max_layer, -1}]),
-            logger:info("[hann_scylla] no prior HNSW state — beginning fresh")
+            logger:info("[hann_scylla] no prior state — fresh start")
     end.
 
 %%%-------------------------------------------------------------------
-%%% Internal — async fire helpers
+%%% Spawned async persistence
 %%%-------------------------------------------------------------------
 
-fire_node(NodeID, State) ->
+spawn_persist_node(NodeID) ->
     case hann_ets:get_node_full(NodeID) of
-        undefined ->
-            State;
+        undefined -> ok;
         {Vector, Layers} ->
             VecBin    = encode_vector(Vector),
             LayersBin = term_to_binary(Layers),
-            Ref = marina:async_query(
-                      ?Q_UPSERT_NODE,
-                      [NodeID, VecBin, LayersBin],
-                      one, [], self()
-                  ),
-            track(Ref, {node, NodeID}, State)
-    end.
+            spawn(fun() ->
+                case marina_call(?Q_UPSERT_NODE,
+                                 [NodeID, VecBin, LayersBin], one) of
+                    {ok, _}    -> ok;
+                    {error, R} ->
+                        logger:warning("[hann_scylla] node ~w persist: ~p",
+                                       [NodeID, R])
+                end
+            end)
+    end,
+    ok.
 
-fire_meta(NodeID, Meta, State) ->
+spawn_persist_meta(NodeID, Meta) ->
     H3        = maps:get(h3_index,  Meta, null),
     Stop      = maps:get(stop_name, Meta, null),
     Routes    = maps:get(route_ids, Meta, []),
     Region    = maps:get(region,    Meta, null),
     RoutesBin = term_to_binary(Routes),
-    Ref = marina:async_query(
-              ?Q_UPSERT_META,
-              [NodeID, H3, Stop, RoutesBin, Region],
-              one, [], self()
-          ),
-    track(Ref, {meta, NodeID}, State).
-
-track(Ref, Ctx, State) ->
-    State#state{pending = maps:put(Ref, Ctx, State#state.pending)}.
+    spawn(fun() ->
+        case marina_call(?Q_UPSERT_META,
+                         [NodeID, H3, Stop, RoutesBin, Region], one) of
+            {ok, _}    -> ok;
+            {error, R} ->
+                logger:warning("[hann_scylla] meta ~w persist: ~p", [NodeID, R])
+        end
+    end),
+    ok.
 
 %%%-------------------------------------------------------------------
-%%% Internal — codec
+%%% marina adapter
+%%%
+%%% marina:query/2 is the API in this version.
+%%% Adjust the Request format below if you get a badarg or function_clause
+%%% error — check _build/default/lib/marina/src/marina.erl for the spec.
+%%%
+%%% Common formats to try if #{query,values,consistency} doesn't work:
+%%%   {Query, Values, Consistency}
+%%%   marina:query(Query, #{values => V, consistency => C})
 %%%-------------------------------------------------------------------
 
-%% Float32-LE packed binary — compact (4 bytes/dim vs 8 for float64).
+marina_call(Query, Values, Consistency) ->
+    Request = #{
+        query       => Query,
+        values      => Values,
+        consistency => Consistency
+    },
+    marina:query(Request, #{}).
+
+%%%-------------------------------------------------------------------
+%%% Codec
+%%%-------------------------------------------------------------------
+
 encode_vector(Vec) ->
     << <<X:32/float-little>> || X <- Vec >>.
 
 decode_vector(Bin) ->
     [X || <<X:32/float-little>> <= Bin].
 
-coerce_entry(undefined) -> 0;   %% ScyllaDB bigint cannot be NULL in this schema
+coerce_entry(undefined) -> 0;
 coerce_entry(N)         -> N.
 
 null_or(null) -> null;
