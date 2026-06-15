@@ -7,7 +7,7 @@
 -export([start/2, stop/1]).
 
 start(_StartType, _StartArgs) ->
-    Port   = application:get_env(himap_hann, port,         8080),
+    Port   = application:get_env(himap_hann, port,         9950),
     Dim    = application:get_env(himap_hann, hnsw_dim,     128),
     M      = application:get_env(himap_hann, hnsw_m,       16),
     Ef     = application:get_env(himap_hann, hnsw_ef,      64),
